@@ -40,6 +40,29 @@ privacy and avoids paying for persistent storage.
 Never put either secret in GitHub, a Telegram message, or a screenshot. If a
 token is exposed, revoke it in BotFather and replace the Railway variable.
 
+### YouTube links on Railway
+
+YouTube sometimes blocks downloads originating from cloud-provider IP
+addresses. The error is `Sign in to confirm you're not a bot`; it is imposed
+by YouTube, not caused by the Telegram bot or the link format. The downloader
+now retries normal public links and gives this Turkish diagnosis instead of
+printing a long technical traceback.
+
+If YouTube still blocks a link, export a Netscape-format `cookies.txt` from a
+YouTube session you are authorized to use, Base64-encode the file **locally**,
+and put only that Base64 text in Railway as the secret variable
+`YOUTUBE_COOKIES_B64`. If YouTube requires it for the selected video, add its
+matching `YOUTUBE_PO_TOKEN` there too. Never upload either value to GitHub or
+send it through Telegram; treat cookies like a password. The values are read
+only inside the Railway container and are deleted with the temporary job files.
+
+There is no safe universal code-only bypass for YouTube's anti-automation
+check. For a link that YouTube deliberately blocks, the alternatives are a
+properly authorized Railway session as above, or sending a compatible source
+file. The normal Telegram cloud Bot API itself has a 20 MB download limit;
+that is why large direct uploads need either a public source link or a separate
+Telegram Local Bot API deployment.
+
 ## Run on your own computer (optional)
 
 1. Install Python 3.11+ and create a virtual environment:

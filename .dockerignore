@@ -1,0 +1,10 @@
+.env
+.git
+.gitignore
+__pycache__/
+.pip-tmp/
+.deps/
+.venv/
+jobs/
+*.pyc
+*.mp4

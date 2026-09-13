@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+.pip-tmp/
+.deps/
+jobs/
+*.pyc
+*.mp4

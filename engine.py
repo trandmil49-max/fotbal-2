@@ -49,14 +49,14 @@ def download_url(url: str, job_dir: Path) -> Path:
         raise RuntimeError("yt-dlp kurulu değil. Railway dağıtım kaydını kontrol edin.") from exc
     maximum = int(os.getenv("MAX_LINK_DOWNLOAD_MB", "300")) * 1024 * 1024
     destination = str(job_dir / "linked-source.%(ext)s")
-    extractor_args: dict[str, dict[str, list[str]]] = {}
     po_token = os.getenv("YOUTUBE_PO_TOKEN", "").strip()
-    if po_token:
-        extractor_args["youtube"] = {"player_client": ["default", "mweb"], "po_token": [f"mweb.gvs+{po_token}"]}
-    opts = {"outtmpl": destination, "quiet": True, "noplaylist": True, "max_filesize": maximum,
-            "format": "mp4[height<=1080]/mp4/best[height<=1080]/best", "retries": 3,
-            "fragment_retries": 3, "extractor_args": extractor_args}
+
+    base_opts = {"outtmpl": destination, "quiet": True, "noplaylist": True, "max_filesize": maximum,
+                 "format": "mp4[height<=1080]/mp4/best[height<=1080]/best", "retries": 3,
+                 "fragment_retries": 3}
+
     cookies_b64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+    cookie_path = None
     if cookies_b64:
         try:
             cookie_path = job_dir / "youtube-cookies.txt"
@@ -72,16 +72,25 @@ def download_url(url: str, job_dir: Path) -> Path:
             # dosyayı geçersiz sayabiliyor.
             decoded = decoded.replace("\r\n", "\n").replace("\r", "\n")
             cookie_path.write_text(decoded, encoding="utf-8")
-            opts["cookiefile"] = str(cookie_path)
         except Exception as exc:
             raise RuntimeError("YOUTUBE_COOKIES_B64 değeri okunamadı. Railway değişkenine cookies.txt içeriğini olduğu gibi yapıştırın.") from exc
-    # The normal extractor is tried first. A second, lightweight YouTube TV
-    # client attempt helps with some Shorts URLs without adding a paid service.
-    attempts = [opts]
-    if "youtu" in url.lower() and not cookies_b64:
-        tv_opts = dict(opts)
-        tv_opts["extractor_args"] = {"youtube": {"player_client": ["tv", "ios"]}}
-        attempts.append(tv_opts)
+
+    # YouTube, "web" istemcisinde cookies ile bile bazen ekstra bir doğrulama
+    # (PO Token) istiyor - bunu aşmak için farklı "istemci kimliklerini"
+    # (telefon uygulaması gibi görünme) SIRAYLA deniyoruz. Cookies varsa her
+    # denemeye ekleniyor, PO token varsa web denemesine ekleniyor.
+    client_strategies = ["android", "ios", "tv", "web", "mweb"]
+    attempts = []
+    for client in client_strategies:
+        attempt = dict(base_opts)
+        extractor_args = {"youtube": {"player_client": [client]}}
+        if po_token and client in ("web", "mweb"):
+            extractor_args["youtube"]["po_token"] = [f"{client}.gvs+{po_token}"]
+        attempt["extractor_args"] = extractor_args
+        if cookie_path:
+            attempt["cookiefile"] = str(cookie_path)
+        attempts.append(attempt)
+
     errors: list[Exception] = []
     info = None
     path = None
@@ -96,12 +105,12 @@ def download_url(url: str, job_dir: Path) -> Path:
     if path is None or info is None:
         exc = errors[-1]
         detail = str(exc)
-        if "Sign in to confirm you’re not a bot" in detail or "Sign in to confirm you're not a bot" in detail:
+        if "Sign in to confirm you’re not a bot" in detail or "Sign in to confirm you're not a bot" in detail or "reloaded" in detail.lower():
             raise RuntimeError(
-                "YouTube, Railway sunucusundan bu link için bot doğrulaması istiyor. Bu, bağlantı biçimi hatası değil. "
-                "Railway Variables bölümüne yetkili bir YouTube oturumunun Base64 cookies.txt değerini YOUTUBE_COOKIES_B64, "
-                "gerekiyorsa eşleşen PO Token'ı YOUTUBE_PO_TOKEN olarak ekleyip yeniden deneyin. "
-                "Bu değerleri Telegram'a veya GitHub'a göndermeyin. Alternatif olarak videoyu doğrudan Telegram'a yükleyin."
+                "YouTube, Railway sunucusundan gelen bu isteği bot sanıp reddediyor (denediğim tüm "
+                f"yöntemler başarısız oldu: {', '.join(client_strategies)}). Bu, bağlantı biçimi hatası değil, "
+                "YouTube'un kendi engeli. En güvenilir çözüm: videoyu YouTube'dan kendi bilgisayarına indirip "
+                "doğrudan buraya (Telegram'a) yüklemek. Son hata: " + detail[:300]
             ) from exc
         if "Private video" in detail or "not available" in detail.lower():
             raise RuntimeError("Bu bağlantı herkese açık değil veya bu bölgeden erişilemiyor. Herkese açık başka bir video bağlantısı deneyin.") from exc

@@ -21,11 +21,10 @@ polling, so it does not need a website URL, a webhook, or an open port.
 2. In Railway, select **New Project → Deploy from GitHub Repo** and choose the
    repository. Railway automatically detects the included `Dockerfile`; it
    also installs FFmpeg for MP4 output.
-3. In the Railway service's **Variables** section, add:
+3. In the Railway service's **Variables** section, add only:
    - `TELEGRAM_BOT_TOKEN` — token from BotFather
-   - `OPENAI_API_KEY` — needed for automatic match and awarded-goal analysis
-   - optionally `OPENAI_VISION_MODEL`, `MAX_TELEGRAM_DOWNLOAD_MB`, and
-     `MAX_LINK_DOWNLOAD_MB` from `.env.example`
+   - optionally `MAX_TELEGRAM_DOWNLOAD_MB` and `MAX_LINK_DOWNLOAD_MB` from
+     `.env.example`
 4. Click **Deploy**. The deployment log must end with polling started and must
    not show a missing-token error. Send `/start` to the Telegram bot once to
    check it answers.
@@ -69,8 +68,7 @@ Telegram Local Bot API deployment.
    `py -m venv .venv`
 2. Activate it: `.\.venv\Scripts\Activate.ps1`
 3. Install packages: `pip install -r requirements.txt`
-4. Copy `.env.example` to `.env`, add the token from BotFather and, for
-   automatic analysis, an OpenAI API key.
+4. Copy `.env.example` to `.env` and add the token from BotFather.
 5. Run: `python bot.py`
 
 The first OpenCV install includes the MP4 writer needed by this project. If the
@@ -96,17 +94,21 @@ and reports download, site, size, and analysis errors rather than going quiet.
 The code limits URL downloads to 300 MB; change the environment value only if
 the server has the capacity.
 
-## Analysis reliability
+## Ücretsiz yerel skor analizi
 
-With `OPENAI_API_KEY`, the bot samples the actual clip and asks the vision
-model for structured match identification and only **counted** goal events.
-It requires a visible score change or an explicit confirmation that the goal
-was awarded; a goal marked `offside`, `disallowed`, or `not awarded` is never
-added to the timeline. A low-confidence match identity is labelled
-`UNVERIFIED`, rather than being presented as fact. No system can reliably
-identify every historical match or VAR decision from a short edited clip, so
-the bot preserves that uncertainty in its status message.
+Bu sürüm OpenAI, Gemini veya başka ücretli bir analiz API'si kullanmaz.
+Docker içindeki açık kaynak Tesseract OCR, videonun üst bölümündeki yayıncı
+skor tabelasını iki saniyelik aralıklarla okur. Aynı skor iki kez görülmeden
+değişim kabul edilmez; yalnızca `1-0` veya `0-1` şeklinde artan doğrulanmış
+değişim zaman çizelgesine gol olarak eklenir. Bu nedenle ekrandaki ofsayt/VAR
+pozisyonu skor tabelasına yansımadıysa overlay'e de gol eklenmez.
 
-Without an API key the bot still produces a valid 0–0 green-screen overlay
-from the logos; it does not fabricate a match or score. Add match details in
-the caption or enable vision analysis for automatic scoring.
+Bu yaklaşım ücretsizdir; ancak videoda sürekli okunabilir bir skor tabelası
+yoksa maç adı, turnuva/final bilgisi veya görünmeyen goller güvenilir biçimde
+çıkarılamaz. Böyle bir durumda bot yine yeşil ekran MP4 üretir, fakat skor
+uydurmaz. Takım adlarının görünmesi için linkle birlikte `Real Madrid vs
+Barcelona` gibi kısa bir not gönderebilirsin.
+
+Skor zaman çizelgesinin iki kez görülen skor değişimini kabul ettiğini kontrol
+eden ücretsiz yerel testler de pakette vardır: `python -m unittest
+tests/test_timeline.py`.

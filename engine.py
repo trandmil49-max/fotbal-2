@@ -1,4 +1,4 @@
-"""Source download, cautious vision analysis, and deterministic overlay rendering."""
+"""Source download, local scoreboard OCR, and deterministic overlay rendering."""
 from __future__ import annotations
 
 import base64
@@ -30,6 +30,7 @@ class MatchFacts:
     season: str = ""
     confidence: float = 0.0
     goals: list[Goal] = field(default_factory=list)
+    analysis_note: str = ""
 
     @property
     def final_home(self) -> int: return sum(g.team == "home" and g.awarded for g in self.goals)
@@ -63,11 +64,26 @@ def download_url(url: str, job_dir: Path) -> Path:
             opts["cookiefile"] = str(cookie_path)
         except Exception as exc:
             raise RuntimeError("YOUTUBE_COOKIES_B64 geçersiz. Railway değişkenine cookies.txt içeriğinin Base64 hâlini girin.") from exc
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            path = Path(ydl.prepare_filename(info))
-    except Exception as exc:
+    # The normal extractor is tried first. A second, lightweight YouTube TV
+    # client attempt helps with some Shorts URLs without adding a paid service.
+    attempts = [opts]
+    if "youtu" in url.lower() and not cookies_b64:
+        tv_opts = dict(opts)
+        tv_opts["extractor_args"] = {"youtube": {"player_client": ["tv", "ios"]}}
+        attempts.append(tv_opts)
+    errors: list[Exception] = []
+    info = None
+    path = None
+    for attempt in attempts:
+        try:
+            with yt_dlp.YoutubeDL(attempt) as ydl:
+                info = ydl.extract_info(url, download=True)
+                path = Path(ydl.prepare_filename(info))
+            break
+        except Exception as exc:
+            errors.append(exc)
+    if path is None or info is None:
+        exc = errors[-1]
         detail = str(exc)
         if "Sign in to confirm you’re not a bot" in detail or "Sign in to confirm you're not a bot" in detail:
             raise RuntimeError(
@@ -107,55 +123,75 @@ def _frames(path: Path, count: int = 12) -> tuple[list[np.ndarray], float]:
     return result, duration
 
 
-def _vision(frames: list[np.ndarray], hint: str, duration: float) -> MatchFacts:
-    key = os.getenv("OPENAI_API_KEY")
-    if not key: return MatchFacts()
+def _score_from_frame(frame: np.ndarray) -> tuple[int, int] | None:
+    """Read a broadcast score in the top part of a frame without any web API."""
     try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RuntimeError("OpenAI paketi kurulu değil. Railway dağıtım kaydını kontrol edin.") from exc
-    # Four representative frames fit comfortably and avoid treating celebrations as proof.
-    image_parts = []
-    for frame in frames[::max(1, len(frames)//4)][:4]:
-        ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-        if ok: image_parts.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(encoded).decode()}})
-    prompt = """Identify this football clip cautiously. Return JSON only with keys home, away, stage, season, confidence (0..1), goals.
-goals must be an array of {second:number,team:'home'|'away',awarded:boolean}. Add an event ONLY when it is clearly an
-AWARDED goal: visible scoreboard change, goal confirmation graphic, or unambiguous official confirmation. A shot,
-celebration, offside, VAR review, penalty appeal, or disallowed goal is not an awarded goal. If uncertain, return no goal.
-Do not infer a full-match score from a short highlight. The clip duration is %s seconds. User's untrusted hint: %s""" % (round(duration,1), hint or "none")
-    content = [{"type":"text", "text":prompt}, *image_parts]
+        import pytesseract
+    except ImportError:
+        return None
+    height, width = frame.shape[:2]
+    # Football broadcasts normally reserve the upper band for the scoreboard.
+    crop = frame[:max(100, int(height * .28)), :]
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
     try:
-        response = OpenAI(api_key=key).chat.completions.create(
-            model=os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini"),
-            response_format={"type":"json_object"}, messages=[{"role":"user", "content":content}], temperature=0,
-        )
-        data = json.loads(response.choices[0].message.content or "{}")
-    except Exception as exc:
-        raise RuntimeError(f"Görsel analiz başarısız oldu: {type(exc).__name__}: {exc}") from exc
-    goals = []
-    for x in data.get("goals", []):
-        if x.get("awarded") is True and x.get("team") in ("home", "away"):
-            goals.append(Goal(max(0, min(float(x.get("second", 0)), duration)), x["team"], True))
-    return MatchFacts(str(data.get("home") or "HOME")[:28], str(data.get("away") or "AWAY")[:28],
-                      str(data.get("stage") or "")[:20].upper(), str(data.get("season") or "")[:20],
-                      max(0, min(float(data.get("confidence", 0)), 1)), sorted(goals, key=lambda g:g.second))
+        text = pytesseract.image_to_string(gray, config="--psm 11 -c tessedit_char_whitelist=0123456789-")
+    except Exception:
+        return None
+    pairs = re.findall(r"(?<!\d)([0-9]{1,2})\s*-\s*([0-9]{1,2})(?!\d)", text)
+    for left, right in pairs:
+        home, away = int(left), int(right)
+        if home <= 15 and away <= 15:  # reject clock/time-like values
+            return home, away
+    return None
+
+
+def _local_score_timeline(frames: list[np.ndarray], duration: float) -> list[Goal]:
+    """Turn stable visual score changes into goals; no score change means no goal."""
+    stable: tuple[int, int] | None = None
+    candidate: tuple[int, int] | None = None
+    repeats = 0
+    goals: list[Goal] = []
+    for index, frame in enumerate(frames):
+        observed = _score_from_frame(frame)
+        if observed is None:
+            continue
+        if observed == candidate:
+            repeats += 1
+        else:
+            candidate, repeats = observed, 1
+        # Two matching samples prevent a one-frame OCR mistake from becoming a goal.
+        if repeats < 2 or observed == stable:
+            continue
+        stamp = duration * index / max(1, len(frames) - 1)
+        if stable is None:
+            stable = observed
+            continue
+        home_delta, away_delta = observed[0] - stable[0], observed[1] - stable[1]
+        if (home_delta, away_delta) == (1, 0):
+            goals.append(Goal(stamp, "home")); stable = observed
+        elif (home_delta, away_delta) == (0, 1):
+            goals.append(Goal(stamp, "away")); stable = observed
+    return goals
 
 
 def analyse_clip(path: Path, hint: str) -> MatchFacts:
-    # Around one frame per two seconds catches most edit transitions without
-    # blindly trusting a single celebration frame. The vision request itself
-    # selects evenly spaced representatives to control cost.
+    # One frame per two seconds is local CPU work, not a paid cloud call.
     _, duration = _frames(path, 2)
     frames, _ = _frames(path, min(60, max(12, int(duration / 2))))
     title_file = path.parent / "source-details.txt"
     if title_file.exists():
         hint = (hint + " | public source title: " + title_file.read_text(encoding="utf-8")[:180]).strip(" |")
-    facts = _vision(frames, hint, duration)
-    # An explicit human hint may provide labels, never score events. It is intentionally only a fallback.
-    if facts.home == "HOME" and hint:
+    facts = MatchFacts(goals=_local_score_timeline(frames, duration))
+    # A source title/caption can label teams, but never creates a score event.
+    if hint:
         m = re.search(r"([^,;]+?)\s+(?:vs\.?|v\.?|[-–])\s+([^,;]+)", hint, re.I)
         if m: facts.home, facts.away = m.group(1).strip()[:28], m.group(2).strip()[:28]
+    if facts.goals:
+        facts.confidence = .75
+    else:
+        facts.analysis_note = "Videodaki skor tabelasında doğrulanmış değişim bulunamadı"
     return facts
 
 
@@ -193,8 +229,10 @@ def _center(draw: ImageDraw.ImageDraw, text: str, y: int, font: ImageFont.ImageF
     draw.text(((1080-(box[2]-box[0]))/2, y), text, font=font, fill=fill, stroke_width=3, stroke_fill=(0,0,0))
 
 
-def make_overlay(source: Path, logo_home: Path, logo_away: Path, facts: MatchFacts, job_dir: Path) -> Path:
-    frames, duration = _frames(source, 2)
+def make_overlay(source: Path | None, logo_home: Path, logo_away: Path, facts: MatchFacts, job_dir: Path) -> Path:
+    # If a link host refuses the download, still return a usable 10-second
+    # green-screen template instead of failing the entire Telegram job.
+    duration = _frames(source, 2)[1] if source else 10.0
     # TikTok-friendly vertical overlay. The content sits in the top safe area, the rest is pure green.
     width, height, fps = 1080, 1920, 12
     output = job_dir / "green-screen-score-overlay.mp4"
@@ -211,13 +249,13 @@ def make_overlay(source: Path, logo_home: Path, logo_away: Path, facts: MatchFac
             else: away += 1
             event_index += 1
         image = Image.new("RGB", (width,height), GREEN); draw = ImageDraw.Draw(image)
-        if facts.stage: _center(draw, facts.stage, 100, _font(54))
-        elif facts.confidence < .75: _center(draw, "UNVERIFIED MATCH", 100, _font(42), (255,230,0))
-        image.paste(left, (120,190), left); image.paste(right, (730,190), right)
-        _center(draw, "VS", 250, _font(70))
-        _center(draw, f"{home}  -  {away}", 450, _font(150))
-        _center(draw, facts.home.upper(), 670, _font(38)); _center(draw, facts.away.upper(), 730, _font(38))
-        if facts.season: _center(draw, facts.season.upper(), 805, _font(34), (220,220,220))
+        if facts.stage: _center(draw, facts.stage, 95, _font(54))
+        # Wide crest spacing and a heavy centred VS/score mirror the supplied
+        # reference while keeping all pixels behind them pure chroma green.
+        image.paste(left, (110,170), left); image.paste(right, (740,170), right)
+        _center(draw, "VS", 265, _font(72))
+        _center(draw, f"{home} - {away}", 445, _font(158))
+        if facts.season: _center(draw, facts.season.upper(), 650, _font(36), (220,220,220))
         writer.write(cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR))
     writer.release()
     if not output.exists() or output.stat().st_size < 1024: raise RuntimeError("Overlay oluşturuldu fakat kullanılabilir MP4 üretilmedi.")

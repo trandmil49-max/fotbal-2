@@ -153,15 +153,28 @@ async def run_job(update: Update, context: ContextTypes.DEFAULT_TYPE, s: Session
     msg = await update.effective_message.reply_text("Her şey hazır. Kaynağı kontrol edip analizi başlatıyorum…")
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
+        source_problem = ""
         if s.video is None:
             await msg.edit_text("Herkese açık link indiriliyor…")
-            s.video = await asyncio.to_thread(download_url, s.url, s.job_dir)
-        await msg.edit_text("Video örnekleniyor; maç ve sayılan goller doğrulanıyor…")
-        facts = await asyncio.to_thread(analyse_clip, s.video, s.note)
+            try:
+                s.video = await asyncio.to_thread(download_url, s.url, s.job_dir)
+            except RuntimeError as exc:
+                # YouTube can refuse cloud IPs. Send a useful template instead
+                # of abandoning the user's logos and session.
+                source_problem = str(exc)
+        if s.video:
+            await msg.edit_text("Video örnekleniyor; maç ve sayılan goller doğrulanıyor…")
+            facts = await asyncio.to_thread(analyse_clip, s.video, s.note)
+        else:
+            facts = MatchFacts(analysis_note="Kaynak indirilemedi; 10 saniyelik başlangıç overlay'i oluşturuldu")
         await msg.edit_text("Yeşil ekran skor zaman çizelgesi oluşturuluyor…")
         output = await asyncio.to_thread(make_overlay, s.video, s.logos[0], s.logos[1], facts, s.job_dir)
         confidence = "doğrulandı" if facts.confidence >= 0.75 else "DOĞRULANMADI"
         caption = f"Yeşil ekran overlay hazır ({confidence}). {facts.home} {facts.final_home}-{facts.final_away} {facts.away}."
+        if facts.analysis_note:
+            caption += "\nNot: " + facts.analysis_note
+        if source_problem:
+            caption += "\nNot: Linkteki video indirilemediği için 10 saniyelik başlangıç şablonu üretildi."
         await context.bot.send_document(update.effective_chat.id, document=output.open("rb"), caption=caption)
         await msg.delete()
     except Exception as exc:

@@ -60,10 +60,17 @@ def download_url(url: str, job_dir: Path) -> Path:
     if cookies_b64:
         try:
             cookie_path = job_dir / "youtube-cookies.txt"
-            cookie_path.write_bytes(base64.b64decode(cookies_b64, validate=True))
+            # Hem Base64'e çevrilmiş hem de düz metin (cookies.txt'den doğrudan
+            # kopyala-yapıştır) hali kabul ediliyor - kullanıcı ekstra bir
+            # çevirme adımı yapmak zorunda değil.
+            try:
+                decoded = base64.b64decode(cookies_b64, validate=True)
+            except Exception:
+                decoded = cookies_b64.encode("utf-8")
+            cookie_path.write_bytes(decoded)
             opts["cookiefile"] = str(cookie_path)
         except Exception as exc:
-            raise RuntimeError("YOUTUBE_COOKIES_B64 geçersiz. Railway değişkenine cookies.txt içeriğinin Base64 hâlini girin.") from exc
+            raise RuntimeError("YOUTUBE_COOKIES_B64 değeri okunamadı. Railway değişkenine cookies.txt içeriğini olduğu gibi yapıştırın.") from exc
     # The normal extractor is tried first. A second, lightweight YouTube TV
     # client attempt helps with some Shorts URLs without adding a paid service.
     attempts = [opts]
@@ -214,9 +221,14 @@ def _logo(path: Path, size: int = 230) -> Image.Image:
     px = np.asarray(image).copy()
     # Only remove near-white / near-black pixels connected to the border; white inside a crest remains.
     rgb = px[:,:,:3]; alpha = px[:,:,3]
-    candidate = (((rgb.min(axis=2) > 238) | (rgb.max(axis=2) < 12)) & (alpha > 0)).astype(np.uint8)
-    flood = np.zeros((candidate.shape[0]+2, candidate.shape[1]+2), np.uint8)
-    cv2.floodFill(candidate, flood, (0,0), 2)
+    candidate = (((rgb.min(axis=2) > 230) | (rgb.max(axis=2) < 18)) & (alpha > 0)).astype(np.uint8)
+    h, w = candidate.shape
+    flood = np.zeros((h+2, w+2), np.uint8)
+    # Dört köşeden de temizlik yap (sadece sol üstten değil) - böylece
+    # arka plan hangi köşede olursa olsun tam kapsanır.
+    for seed in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)]:
+        if candidate[seed[1], seed[0]] == 1:
+            cv2.floodFill(candidate, flood, seed, 2)
     px[candidate == 2, 3] = 0
     result = Image.fromarray(px).convert("RGBA")
     result.thumbnail((size, size), Image.Resampling.LANCZOS)
@@ -233,15 +245,23 @@ def make_overlay(source: Path | None, logo_home: Path, logo_away: Path, facts: M
     # If a link host refuses the download, still return a usable 10-second
     # green-screen template instead of failing the entire Telegram job.
     duration = _frames(source, 2)[1] if source else 10.0
-    # TikTok-friendly vertical overlay. The content sits in the top safe area, the rest is pure green.
+    # TikTok-friendly vertical overlay. Herşey ekranın DİKEY ORTASINDA
+    # tek bir satırda duruyor: logo - skor - VS - skor - logo.
     width, height, fps = 1080, 1920, 12
     output = job_dir / "green-screen-score-overlay.mp4"
     writer = cv2.VideoWriter(str(output), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
     if not writer.isOpened(): raise RuntimeError("MP4 yazıcısı kullanılamıyor. Railway dağıtım kaydını kontrol edin.")
-    left, right = _logo(logo_home), _logo(logo_away)
+    left, right = _logo(logo_home, 190), _logo(logo_away, 190)
     events = [g for g in facts.goals if g.awarded]
     home = away = event_index = 0
     total = max(1, int(duration * fps))
+
+    logo_size = 190
+    center_y = height // 2  # ekranın tam dikey ortası
+    logo_top = center_y - logo_size // 2
+    logo_gap = 270  # merkezden logoya uzaklık - çift haneli skorlarda bile metinle çakışmaması, ekran dışına taşmaması için hesaplandı
+    center_font_size = 85
+
     for n in range(total):
         t = n / fps
         while event_index < len(events) and events[event_index].second <= t:
@@ -249,13 +269,20 @@ def make_overlay(source: Path | None, logo_home: Path, logo_away: Path, facts: M
             else: away += 1
             event_index += 1
         image = Image.new("RGB", (width,height), GREEN); draw = ImageDraw.Draw(image)
-        if facts.stage: _center(draw, facts.stage, 95, _font(54))
-        # Wide crest spacing and a heavy centred VS/score mirror the supplied
-        # reference while keeping all pixels behind them pure chroma green.
-        image.paste(left, (110,170), left); image.paste(right, (740,170), right)
-        _center(draw, "VS", 265, _font(72))
-        _center(draw, f"{home} - {away}", 445, _font(158))
-        if facts.season: _center(draw, facts.season.upper(), 650, _font(36), (220,220,220))
+        if facts.stage:
+            _center(draw, facts.stage, logo_top - 70, _font(54))
+        image.paste(left, (540 - logo_gap - logo_size, logo_top), left)
+        image.paste(right, (540 + logo_gap, logo_top), right)
+        # Logo - skor - VS - skor - logo, hepsi AYNI satırda, dikey ortada
+        center_text = f"{home}   VS   {away}"
+        box = draw.textbbox((0, 0), center_text, font=_font(center_font_size), stroke_width=3)
+        text_h = box[3] - box[1]
+        draw.text(
+            (540 - (box[2] - box[0]) / 2, center_y - text_h / 2 - box[1]),
+            center_text, font=_font(center_font_size), fill=(255,255,255), stroke_width=3, stroke_fill=(0,0,0),
+        )
+        if facts.season:
+            _center(draw, facts.season.upper(), logo_top + logo_size + 40, _font(36), (220,220,220))
         writer.write(cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR))
     writer.release()
     if not output.exists() or output.stat().st_size < 1024: raise RuntimeError("Overlay oluşturuldu fakat kullanılabilir MP4 üretilmedi.")

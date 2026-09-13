@@ -64,10 +64,14 @@ def download_url(url: str, job_dir: Path) -> Path:
             # kopyala-yapıştır) hali kabul ediliyor - kullanıcı ekstra bir
             # çevirme adımı yapmak zorunda değil.
             try:
-                decoded = base64.b64decode(cookies_b64, validate=True)
+                decoded = base64.b64decode(cookies_b64, validate=True).decode("utf-8")
             except Exception:
-                decoded = cookies_b64.encode("utf-8")
-            cookie_path.write_bytes(decoded)
+                decoded = cookies_b64
+            # Kopyala-yapıştır sırasında satır sonları bozulabiliyor
+            # (Windows/Mac farkı) - bunu normalize ediyoruz, yoksa yt-dlp
+            # dosyayı geçersiz sayabiliyor.
+            decoded = decoded.replace("\r\n", "\n").replace("\r", "\n")
+            cookie_path.write_text(decoded, encoding="utf-8")
             opts["cookiefile"] = str(cookie_path)
         except Exception as exc:
             raise RuntimeError("YOUTUBE_COOKIES_B64 değeri okunamadı. Railway değişkenine cookies.txt içeriğini olduğu gibi yapıştırın.") from exc

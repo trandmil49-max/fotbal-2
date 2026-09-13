@@ -174,7 +174,7 @@ async def run_job(update: Update, context: ContextTypes.DEFAULT_TYPE, s: Session
         if facts.analysis_note:
             caption += "\nNot: " + facts.analysis_note
         if source_problem:
-            caption += "\nNot: Linkteki video indirilemediği için 10 saniyelik başlangıç şablonu üretildi."
+            caption += "\nNot: Linkten indirilemedi, gerçek sebep: " + source_problem[:500]
         await context.bot.send_document(update.effective_chat.id, document=output.open("rb"), caption=caption)
         await msg.delete()
     except Exception as exc:

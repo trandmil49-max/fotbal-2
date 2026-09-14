@@ -127,34 +127,52 @@ def download_url(url: str, job_dir: Path) -> Path:
     return path
 
 
-def _frames(path: Path, count: int = 12) -> tuple[list[np.ndarray], float, list[float]]:
+def _duration(path: Path) -> float:
+    """Sadece video süresini öğrenir - kare biriktirmeden, hafif."""
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened(): raise RuntimeError("Video açılamadı. MP4/H.264 olarak tekrar yükleyin veya başka bir herkese açık bağlantı deneyin.")
     fps = cap.get(cv2.CAP_PROP_FPS) or 24
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     duration = total / fps if total else 0
+    cap.release()
     if duration <= 0 or duration > 15 * 60: raise RuntimeError("Video süresi okunamadı veya video 15 dakikadan uzun.")
-    # ÖNEMLİ: kare NUMARASINA göre değil, gerçek ZAMANA (milisaniye) göre
-    # arama yapıyoruz. Bazı videolarda toplam kare sayısı metadata'sı hatalı
-    # oluyor, bu da "28. saniyedeki gol 50. saniyede görünüyor" gibi ciddi
-    # zaman kaymalarına yol açıyordu. Milisaniye bazlı arama, videonun
-    # gerçek zaman bilgisini kullandığı için bu kaymaya yol açmıyor.
+    return duration
+
+
+def _sample_scores(path: Path, count: int) -> tuple[list[tuple[float, tuple[int, int] | None]], float]:
+    """Videoyu örnekleyip her noktada skoru okur.
+
+    ÇOK ÖNEMLİ: kareleri bir listede TOPLAMIYORUZ. Her kareyi okur okumaz
+    hemen skoru çıkarıp kareyi hafızadan atıyoruz. Önceki sürüm yüzlerce
+    kareyi aynı anda hafızada tutuyordu - uzun videolarda bu, Railway'in
+    hafıza sınırını aşıp "-9" (bellek yetersizliğinden öldürüldü) hatasına
+    yol açıyordu. Bu şekilde hafıza kullanımı sabit kalıyor, video ne kadar
+    uzun/kaç örnek alınırsa alınsın taşmıyor.
+    """
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened(): raise RuntimeError("Video açılamadı. MP4/H.264 olarak tekrar yükleyin veya başka bir herkese açık bağlantı deneyin.")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    duration = total / fps if total else 0
+    if duration <= 0 or duration > 15 * 60:
+        cap.release()
+        raise RuntimeError("Video süresi okunamadı veya video 15 dakikadan uzun.")
+    # Kare NUMARASINA göre değil, gerçek ZAMANA (milisaniye) göre arama
+    # yapıyoruz - bazı videolarda toplam kare sayısı metadata'sı hatalı
+    # oluyor, bu da zamanlama kaymalarına yol açıyordu.
     positions_ms = np.linspace(0, max(0.0, duration * 1000 - 40), count)
-    result: list[np.ndarray] = []
-    timestamps: list[float] = []
+    samples: list[tuple[float, tuple[int, int] | None]] = []
     for pos_ms in positions_ms:
         cap.set(cv2.CAP_PROP_POS_MSEC, float(pos_ms))
         ok, frame = cap.read()
         if ok:
-            result.append(frame)
-            # Videonun bize GERÇEKTEN hangi zamanı verdiğini geri okuyoruz -
-            # istediğimiz zamanla verilen kare birebir aynı olmayabilir, bu
-            # yüzden gerçek değeri kullanmak en doğrusu.
             actual_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-            timestamps.append((actual_ms / 1000.0) if actual_ms and actual_ms > 0 else (pos_ms / 1000.0))
+            ts = (actual_ms / 1000.0) if actual_ms and actual_ms > 0 else (pos_ms / 1000.0)
+            score = _score_from_frame(frame)
+            samples.append((ts, score))
+            frame = None  # kareyi hemen bırak, biriktirme
     cap.release()
-    if not result: raise RuntimeError("Videoda okunabilir görüntü karesi bulunamadı.")
-    return result, duration, timestamps
+    return samples, duration
 
 
 def _score_from_frame(frame: np.ndarray) -> tuple[int, int] | None:
@@ -181,7 +199,7 @@ def _score_from_frame(frame: np.ndarray) -> tuple[int, int] | None:
     return None
 
 
-def _local_score_timeline(frames: list[np.ndarray], timestamps: list[float]) -> list[Goal]:
+def _local_score_timeline(samples: list[tuple[float, tuple[int, int] | None]]) -> list[Goal]:
     """Turn stable visual score changes into goals; no score change means no goal.
     NOT: Kullanıcının isteği üzerine "iki kere doğrulama" kaldırıldı - artık
     geçerli bir skor değişimi (bir takım için tam +1) görür görmez HEMEN
@@ -189,11 +207,9 @@ def _local_score_timeline(frames: list[np.ndarray], timestamps: list[float]) -> 
     yayın grafikleri olduğu için bu güvenli."""
     stable: tuple[int, int] | None = None
     goals: list[Goal] = []
-    for index, frame in enumerate(frames):
-        observed = _score_from_frame(frame)
+    for stamp, observed in samples:
         if observed is None:
             continue
-        stamp = timestamps[index]
         if stable is None:
             stable = observed
             continue
@@ -217,17 +233,16 @@ def _local_score_timeline(frames: list[np.ndarray], timestamps: list[float]) -> 
 
 
 def analyse_clip(path: Path, hint: str) -> MatchFacts:
-    # One frame per two seconds is local CPU work, not a paid cloud call.
-    _, duration, _ = _frames(path, 2)
+    duration = _duration(path)
     # Zamanlamanın gerçek gol anına olabildiğince yakın olması için sık
-    # örnekliyoruz (yaklaşık saniyede 2 kare) - önceki (2 saniyede 1 kare)
-    # örnekleme, gecikmenin bir kısmının asıl sebebiydi.
+    # örnekliyoruz (yaklaşık saniyede 2 kare) - kareler TEK TEK işlenip
+    # hemen atıldığı için (bkz. _sample_scores) bu hafızayı şişirmiyor.
     sample_count = min(600, max(24, int(duration * 2)))
-    frames, _, timestamps = _frames(path, sample_count)
+    samples, duration = _sample_scores(path, sample_count)
     title_file = path.parent / "source-details.txt"
     if title_file.exists():
         hint = (hint + " | public source title: " + title_file.read_text(encoding="utf-8")[:180]).strip(" |")
-    facts = MatchFacts(goals=_local_score_timeline(frames, timestamps))
+    facts = MatchFacts(goals=_local_score_timeline(samples))
     # A source title/caption can label teams, but never creates a score event.
     if hint:
         m = re.search(r"([^,;]+?)\s+(?:vs\.?|v\.?|[-–])\s+([^,;]+)", hint, re.I)
@@ -291,7 +306,7 @@ def _center(draw: ImageDraw.ImageDraw, text: str, y: int, font: ImageFont.ImageF
 def make_overlay(source: Path | None, logo_home: Path, logo_away: Path, facts: MatchFacts, job_dir: Path) -> Path:
     # If a link host refuses the download, still return a usable 10-second
     # green-screen template instead of failing the entire Telegram job.
-    duration = _frames(source, 2)[1] if source else 10.0
+    duration = _duration(source) if source else 10.0
     width, height, fps = 1080, 1920, 25
     output = job_dir / "green-screen-score-overlay.mp4"
 

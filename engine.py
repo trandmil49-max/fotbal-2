@@ -369,8 +369,17 @@ def make_overlay(source: Path | None, logo_home: Path, logo_away: Path, facts: M
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
         "-f", "concat", "-safe", "0", "-i", str(concat_path),
-        "-vf", f"fps={fps},format=yuv420p", "-c:v", "libx264", "-preset", "medium",
-        "-crf", "16", "-pix_fmt", "yuv420p", str(output),
+        "-vf", f"fps={fps},format=yuv420p",
+        "-c:v", "libx264",
+        # "medium" ön ayarı, Railway'in düşük hafıza sınırını aşıp süreci
+        # öldürtüyordu (çıkış kodu -9). "veryfast" + kısıtlı bakış-ileri
+        # (lookahead) ve iş parçacığı sayısıyla hafıza kullanımı çok daha
+        # düşük - görüntü kalitesi (bizim sabit renkli/az detaylı grafiğimiz
+        # için) gözle fark edilmeyecek kadar yakın kalıyor.
+        "-preset", "veryfast",
+        "-x264-params", "rc-lookahead=10:ref=1",
+        "-threads", "2",
+        "-crf", "18", "-pix_fmt", "yuv420p", str(output),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
 

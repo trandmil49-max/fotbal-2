@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 import shutil
+import gc
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -254,6 +255,7 @@ async def run_job(status_msg, chat_id: int, s: Session, context: ContextTypes.DE
     try:
         await status_msg.edit_text("Video örnekleniyor; goller doğrulanıyor…")
         facts = await asyncio.to_thread(analyse_clip, s.video, s.note)
+        gc.collect()  # analizden kalan hafızayı, overlay üretmeden önce boşalt
         await status_msg.edit_text("Yeşil ekran skor zaman çizelgesi oluşturuluyor…")
         output = await asyncio.to_thread(make_overlay, s.video, s.logos[0], s.logos[1], facts, s.job_dir)
         confidence = "doğrulandı" if facts.confidence >= 0.75 else "DOĞRULANMADI"

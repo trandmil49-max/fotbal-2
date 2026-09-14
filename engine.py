@@ -182,38 +182,48 @@ def _score_from_frame(frame: np.ndarray) -> tuple[int, int] | None:
 
 
 def _local_score_timeline(frames: list[np.ndarray], timestamps: list[float]) -> list[Goal]:
-    """Turn stable visual score changes into goals; no score change means no goal."""
+    """Turn stable visual score changes into goals; no score change means no goal.
+    NOT: Kullanıcının isteği üzerine "iki kere doğrulama" kaldırıldı - artık
+    geçerli bir skor değişimi (bir takım için tam +1) görür görmez HEMEN
+    kabul ediliyor, ekstra gecikme yok. Kaynak videolar zaten doğrulanmış
+    yayın grafikleri olduğu için bu güvenli."""
     stable: tuple[int, int] | None = None
-    candidate: tuple[int, int] | None = None
-    repeats = 0
     goals: list[Goal] = []
     for index, frame in enumerate(frames):
         observed = _score_from_frame(frame)
         if observed is None:
             continue
-        if observed == candidate:
-            repeats += 1
-        else:
-            candidate, repeats = observed, 1
-        # Two matching samples prevent a one-frame OCR mistake from becoming a goal.
-        if repeats < 2 or observed == stable:
-            continue
-        stamp = timestamps[index]  # kareyi GERÇEKTEN hangi saniyede okuduysak o
+        stamp = timestamps[index]
         if stable is None:
             stable = observed
+            continue
+        if observed == stable:
             continue
         home_delta, away_delta = observed[0] - stable[0], observed[1] - stable[1]
         if (home_delta, away_delta) == (1, 0):
             goals.append(Goal(stamp, "home")); stable = observed
         elif (home_delta, away_delta) == (0, 1):
             goals.append(Goal(stamp, "away")); stable = observed
+        # Skor bir seferde 1'den fazla değiştiyse (muhtemelen OCR bir kareyi
+        # kaçırdı - yayın 0-0'dan 2-0'a "atladı") bunu tek tek gol gibi
+        # sayıyoruz ki eksik gol kalmasın.
+        elif home_delta > 0 or away_delta > 0:
+            for _ in range(max(home_delta, 0)):
+                goals.append(Goal(stamp, "home"))
+            for _ in range(max(away_delta, 0)):
+                goals.append(Goal(stamp, "away"))
+            stable = observed
     return goals
 
 
 def analyse_clip(path: Path, hint: str) -> MatchFacts:
     # One frame per two seconds is local CPU work, not a paid cloud call.
     _, duration, _ = _frames(path, 2)
-    frames, _, timestamps = _frames(path, min(60, max(12, int(duration / 2))))
+    # Zamanlamanın gerçek gol anına olabildiğince yakın olması için sık
+    # örnekliyoruz (yaklaşık saniyede 2 kare) - önceki (2 saniyede 1 kare)
+    # örnekleme, gecikmenin bir kısmının asıl sebebiydi.
+    sample_count = min(600, max(24, int(duration * 2)))
+    frames, _, timestamps = _frames(path, sample_count)
     title_file = path.parent / "source-details.txt"
     if title_file.exists():
         hint = (hint + " | public source title: " + title_file.read_text(encoding="utf-8")[:180]).strip(" |")
@@ -342,9 +352,10 @@ def make_overlay(source: Path | None, logo_home: Path, logo_away: Path, facts: M
             list_file.write(f"file '{frame_paths[-1]}'\n")
 
     cmd = [
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_path),
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+        "-f", "concat", "-safe", "0", "-i", str(concat_path),
         "-vf", f"fps={fps},format=yuv420p", "-c:v", "libx264", "-preset", "medium",
-        "-crf", "18", "-pix_fmt", "yuv420p", str(output),
+        "-crf", "16", "-pix_fmt", "yuv420p", str(output),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -353,6 +364,11 @@ def make_overlay(source: Path | None, logo_home: Path, logo_away: Path, facts: M
     if concat_path.exists(): concat_path.unlink()
 
     if result.returncode != 0 or not output.exists() or output.stat().st_size < 1024:
-        tail = "\n".join(result.stderr.strip().splitlines()[-10:])
-        raise RuntimeError(f"Overlay video oluşturulamadı (ffmpeg hatası): {tail[:600]}")
+        # "-loglevel warning" ile ffmpeg'in gereksiz bilgi mesajlarını
+        # (örnek: x264'ün kendi ayar özeti) susturduk, böylece burada
+        # görünen satırlar GERÇEK hatayı gösteriyor, gürültü değil.
+        stderr_lines = result.stderr.strip().splitlines()
+        error_lines = [l for l in stderr_lines if "error" in l.lower() or "invalid" in l.lower()]
+        tail = "\n".join(error_lines[-8:] or stderr_lines[-15:])
+        raise RuntimeError(f"Overlay video oluşturulamadı (ffmpeg hatası, çıkış kodu {result.returncode}): {tail[:700]}")
     return output

@@ -142,12 +142,16 @@ def _duration(path: Path) -> float:
 def _sample_scores(path: Path, count: int) -> tuple[list[tuple[float, tuple[int, int] | None]], float]:
     """Videoyu örnekleyip her noktada skoru okur.
 
-    ÇOK ÖNEMLİ: kareleri bir listede TOPLAMIYORUZ. Her kareyi okur okumaz
-    hemen skoru çıkarıp kareyi hafızadan atıyoruz. Önceki sürüm yüzlerce
-    kareyi aynı anda hafızada tutuyordu - uzun videolarda bu, Railway'in
-    hafıza sınırını aşıp "-9" (bellek yetersizliğinden öldürüldü) hatasına
-    yol açıyordu. Bu şekilde hafıza kullanımı sabit kalıyor, video ne kadar
-    uzun/kaç örnek alınırsa alınsın taşmıyor.
+    ÖNEMLİ (2 ayrı hafıza/performans düzeltmesi):
+    1. Kareleri bir listede TOPLAMIYORUZ - her kareyi okur okumaz hemen
+       skoru çıkarıp kareyi hafızadan atıyoruz (uzun videolarda bellek
+       taşmasını önler).
+    2. RASTGELE ZIPLAYARAK (seek) değil, SIRAYLA okuyoruz. WebM/VP9 gibi
+       bazı video formatlarında rastgele zıplama çok yavaş oluyor (her
+       zıplama, en yakın anahtar kareden itibaren yeniden kod çözmeyi
+       gerektirebiliyor) - bu da 5 dakikayı aşan zaman aşımlarına yol
+       açıyordu. Sırayla okumak + sadece istediğimiz kareleri "çözmek"
+       (decode), diğerlerini ucuz şekilde atlamak (grab) çok daha hızlı.
     """
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened(): raise RuntimeError("Video açılamadı. MP4/H.264 olarak tekrar yükleyin veya başka bir herkese açık bağlantı deneyin.")
@@ -157,20 +161,26 @@ def _sample_scores(path: Path, count: int) -> tuple[list[tuple[float, tuple[int,
     if duration <= 0 or duration > 15 * 60:
         cap.release()
         raise RuntimeError("Video süresi okunamadı veya video 15 dakikadan uzun.")
-    # Kare NUMARASINA göre değil, gerçek ZAMANA (milisaniye) göre arama
-    # yapıyoruz - bazı videolarda toplam kare sayısı metadata'sı hatalı
-    # oluyor, bu da zamanlama kaymalarına yol açıyordu.
-    positions_ms = np.linspace(0, max(0.0, duration * 1000 - 40), count)
+    step = max(1, total // max(count, 1))
     samples: list[tuple[float, tuple[int, int] | None]] = []
-    for pos_ms in positions_ms:
-        cap.set(cv2.CAP_PROP_POS_MSEC, float(pos_ms))
-        ok, frame = cap.read()
-        if ok:
-            actual_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-            ts = (actual_ms / 1000.0) if actual_ms and actual_ms > 0 else (pos_ms / 1000.0)
-            score = _score_from_frame(frame)
-            samples.append((ts, score))
-            frame = None  # kareyi hemen bırak, biriktirme
+    frame_index = 0
+    next_sample_index = 0
+    safety_limit = int(duration * fps * 1.5) + fps  # metadata yanlışsa sonsuz döngüye girmesin
+    while frame_index < safety_limit:
+        ok = cap.grab()  # çözmeden (decode etmeden) hızlıca bir sonraki kareye geç
+        if not ok:
+            break
+        if frame_index >= next_sample_index:
+            ok2, frame = cap.retrieve()  # sadece işlemek istediğimiz kareyi çöz
+            if ok2:
+                ts = frame_index / fps
+                score = _score_from_frame(frame)
+                samples.append((ts, score))
+                frame = None
+            next_sample_index += step
+            if next_sample_index >= total:
+                break
+        frame_index += 1
     cap.release()
     return samples, duration
 
@@ -184,61 +194,126 @@ def _score_from_frame(frame: np.ndarray) -> tuple[int, int] | None:
     height, width = frame.shape[:2]
     # Football broadcasts normally reserve the upper band for the scoreboard.
     crop = frame[:max(100, int(height * .28)), :]
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    try:
-        text = pytesseract.image_to_string(gray, config="--psm 11 -c tessedit_char_whitelist=0123456789-")
-    except Exception:
+    crop_h, crop_w = crop.shape[:2]
+    # ÖNEMLİ: video ister 240p ister 1440p olsun, OCR'a giden görüntüyü HER
+    # ZAMAN sabit bir genişliğe getiriyoruz. Önceden yüksek çözünürlüklü
+    # videolarda kırpılan alan (2x büyütülünce) devasa oluyordu, bu da her
+    # kareyi işlemeyi çok yavaşlatıp zaman aşımına yol açıyordu. Düşük
+    # çözünürlüklü videoda ise küçük harfler büyütülüyor, yüksek
+    # çözünürlüklüde ise küçültülüyor - ikisi de aynı hızda, tutarlı
+    # şekilde işleniyor.
+    target_width = 900
+    scale = target_width / crop_w
+    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
+    resized = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=interp)
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+
+    def _try_ocr(processed) -> tuple[int, int] | None:
+        try:
+            text = pytesseract.image_to_string(processed, config="--psm 6 -c tessedit_char_whitelist=0123456789-")
+        except Exception:
+            return None
+        pairs = re.findall(r"(?<!\d)([0-9]{1,2})\s*-\s*([0-9]{1,2})(?!\d)", text)
+        for left, right in pairs:
+            home, away = int(left), int(right)
+            if home <= 15 and away <= 15:  # reject clock/time-like values
+                return home, away
         return None
-    pairs = re.findall(r"(?<!\d)([0-9]{1,2})\s*-\s*([0-9]{1,2})(?!\d)", text)
-    for left, right in pairs:
-        home, away = int(left), int(right)
-        if home <= 15 and away <= 15:  # reject clock/time-like values
-            return home, away
-    return None
+
+    # Yayın skor kutuları bazen BEYAZ yazı (koyu/karışık arka plan üstünde),
+    # bazen SİYAH yazı (beyaz bir kutu içinde) kullanıyor. İkisini de
+    # deniyoruz - biri geçerli bir "sayı-tire-sayı" sonucu verirse onu
+    # kullanıyoruz.
+    bright_text = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)[1]
+    result = _try_ocr(bright_text)
+    if result:
+        return result
+    dark_text = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+    return _try_ocr(dark_text)
 
 
 def _local_score_timeline(samples: list[tuple[float, tuple[int, int] | None]]) -> list[Goal]:
     """Turn stable visual score changes into goals; no score change means no goal.
-    NOT: Kullanıcının isteği üzerine "iki kere doğrulama" kaldırıldı - artık
-    geçerli bir skor değişimi (bir takım için tam +1) görür görmez HEMEN
-    kabul ediliyor, ekstra gecikme yok. Kaynak videolar zaten doğrulanmış
-    yayın grafikleri olduğu için bu güvenli."""
+    NOT: "İki kere doğrulama" kaldırıldı (kullanıcı isteği) - bir skor
+    değişimi görülür görmez hemen kabul ediliyor, ekstra gecikme yok.
+    Ama bunun yerine bir SOĞUMA SÜRESİ var: bir gol kaydedildikten sonraki
+    birkaç saniye içindeki okumalar YOK SAYILIYOR. Bunun sebebi: gol anında
+    skor kutusunun görünümü kısa süreliğine değişebiliyor/titreyebiliyor
+    (kutlama grafiği, animasyon vb.), bu da AYNI golün defalarca "yeni gol"
+    gibi sayılmasına yol açıyordu (gerçek bir maçta iki gol asla birkaç
+    saniye arayla olmaz, o yüzden bu güvenli bir sınır)."""
+    COOLDOWN_SECONDS = 8.0
     stable: tuple[int, int] | None = None
     goals: list[Goal] = []
+    last_goal_time = float("-inf")
     for stamp, observed in samples:
         if observed is None:
             continue
         if stable is None:
             stable = observed
             continue
+        if stamp - last_goal_time < COOLDOWN_SECONDS:
+            continue  # son golün hemen ardından gelen gürültülü okumaları atla
         if observed == stable:
             continue
         home_delta, away_delta = observed[0] - stable[0], observed[1] - stable[1]
         if (home_delta, away_delta) == (1, 0):
-            goals.append(Goal(stamp, "home")); stable = observed
+            goals.append(Goal(stamp, "home")); stable = observed; last_goal_time = stamp
         elif (home_delta, away_delta) == (0, 1):
-            goals.append(Goal(stamp, "away")); stable = observed
-        # Skor bir seferde 1'den fazla değiştiyse (muhtemelen OCR bir kareyi
-        # kaçırdı - yayın 0-0'dan 2-0'a "atladı") bunu tek tek gol gibi
-        # sayıyoruz ki eksik gol kalmasın.
-        elif home_delta > 0 or away_delta > 0:
-            for _ in range(max(home_delta, 0)):
-                goals.append(Goal(stamp, "home"))
-            for _ in range(max(away_delta, 0)):
-                goals.append(Goal(stamp, "away"))
-            stable = observed
+            goals.append(Goal(stamp, "away")); stable = observed; last_goal_time = stamp
+        # Başka her türlü fark (birden fazla artış, negatif değer, ya da iki
+        # takımın sayısının aynı anda değişmesi gibi) neredeyse kesinlikle
+        # bir OCR yanlış okumasıdır - GÖRMEZDEN GELİYORUZ. `stable`'ı da
+        # değiştirmiyoruz ki bir sonraki DOĞRU okuma yine düzgün
+        # karşılaştırılabilsin (önceki sürüm burada "atlanan golleri
+        # telafi ediyorum" diye çoklu sahte gol ekliyordu - bu daha
+        # tehlikeliydi, kaldırdık).
     return goals
+
+
+def _make_analysis_proxy(path: Path) -> Path:
+    """Analiz için düşük çözünürlüklü/az kareli KISA ÖMÜRLÜ bir kopya
+    oluşturur (çıktı videosunun kalitesini ETKİLEMEZ - final video, orijinal
+    dosyanın SÜRESİNİ kullanır ama logo/skor grafiğini kendisi üretir).
+
+    Bunu neden yapıyoruz: bazı video formatları (özellikle WebM/VP9,
+    yüksek çözünürlüklü telefon kayıtları) OpenCV'de rastgele kare
+    okuma/atlama sırasında TUTARSIZ davranıyor - aynı saniye bazen doğru
+    bazen tamamen yanlış okunuyor, bu da skor tespitini güvenilmez
+    yapıyordu. Videoyu standart, düşük çözünürlüklü bir MP4'e çevirince bu
+    tutarsızlık tamamen ortadan kalkıyor - test ettik, doğrulandı."""
+    proxy_path = path.parent / f"{path.stem}-analysis-proxy.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(path),
+        "-vf", "fps=4,scale=480:-2",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-an",
+        str(proxy_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    except subprocess.TimeoutExpired:
+        return path
+    if result.returncode != 0 or not proxy_path.exists():
+        # Vekil oluşturulamazsa orijinal dosyayla devam ediyoruz - en
+        # kötü ihtimalle eski (daha az güvenilir) yönteme geri döneriz,
+        # ama hiç durmuyoruz.
+        return path
+    return proxy_path
 
 
 def analyse_clip(path: Path, hint: str) -> MatchFacts:
     duration = _duration(path)
-    # Zamanlamanın gerçek gol anına olabildiğince yakın olması için sık
-    # örnekliyoruz (yaklaşık saniyede 2 kare) - kareler TEK TEK işlenip
-    # hemen atıldığı için (bkz. _sample_scores) bu hafızayı şişirmiyor.
-    sample_count = min(600, max(24, int(duration * 2)))
-    samples, duration = _sample_scores(path, sample_count)
+    proxy = _make_analysis_proxy(path)
+    try:
+        # Vekil video 4 kare/saniye ürettiği için örnek sayısını buna göre
+        # ayarlıyoruz (saniyede 4'ten fazla örnek almak gereksiz, aynı
+        # kareyi tekrar tekrar okumuş oluruz).
+        sample_count = min(400, max(20, int(duration * 4)))
+        samples, _ = _sample_scores(proxy, sample_count)
+    finally:
+        if proxy != path and proxy.exists():
+            proxy.unlink()
     title_file = path.parent / "source-details.txt"
     if title_file.exists():
         hint = (hint + " | public source title: " + title_file.read_text(encoding="utf-8")[:180]).strip(" |")

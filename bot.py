@@ -1,22 +1,27 @@
-"""Telegram entry point.  All long work runs off the update handler."""
+"""Telegram entry point. All long work runs off the update handler.
+
+Bu sürümde:
+- Link (YouTube vb.) desteği TAMAMEN KALDIRILDI - kullanıcı sadece telefonundan
+  video yüklüyor, link hiç güvenilir çalışmıyordu.
+- Video + 2 logo TEK ALBÜM olarak birlikte gönderilebiliyor (en kolay yöntem).
+- Her yeni video, önceki maçın logolarını OTOMATİK temizliyor - böylece
+  farklı maçların logoları/videoları birbirine karışmıyor.
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
-import re
 import shutil
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from engine import MatchFacts, analyse_clip, download_url, make_overlay
+from engine import analyse_clip, make_overlay
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -25,65 +30,171 @@ ROOT = Path(__file__).parent
 WORK = ROOT / "jobs"
 WORK.mkdir(exist_ok=True)
 MAX_TG = int(os.getenv("MAX_TELEGRAM_DOWNLOAD_MB", "19")) * 1024 * 1024
-URL_RE = re.compile(r"https?://\S+", re.I)
+GROUP_DEBOUNCE_SECONDS = 1.5  # albümdeki tüm parçaların gelmesini bekleme süresi
 
 
 @dataclass
 class Session:
     logos: list[Path] = field(default_factory=list)
     video: Path | None = None
-    url: str | None = None
     note: str = ""
     running: bool = False
     job_dir: Path | None = None
 
 
 SESSIONS: dict[int, Session] = {}
+# media_group_id -> {"messages": [...], "chat_id":.., "user_id":.., "task": Task}
+GROUPS: dict[str, dict] = {}
 
 
 def session_for(user_id: int) -> Session:
     return SESSIONS.setdefault(user_id, Session())
 
 
-def source_ready(s: Session) -> bool:
-    return s.video is not None or s.url is not None
+def reset_session(user_id: int) -> None:
+    """Bir iş bitince ya da yeni bir video gelince eski logo/video kalıntısı
+    kalmasın diye oturumu tamamen temizliyoruz. Bu, önceki bir maçın
+    logolarının yanlışlıkla yeni bir videoyla eşleşmesini (yanlış maç
+    karışması hatasını) kökten önlüyor."""
+    old = SESSIONS.pop(user_id, None)
+    if old and old.job_dir:
+        shutil.rmtree(old.job_dir, ignore_errors=True)
 
 
 def status(s: Session) -> str:
-    bits = [f"logo: {len(s.logos)}/2", "video: hazır" if s.video else "video: yok", "link: hazır" if s.url else "link: yok"]
-    return " • ".join(bits)
+    return f"logo: {len(s.logos)}/2 • video: {'hazır' if s.video else 'yok'}"
+
+
+def _job_dir_for(user_id: int) -> Path:
+    return Path(tempfile.mkdtemp(prefix=f"tg-{user_id}-", dir=WORK))
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    s = session_for(update.effective_user.id)
     await update.effective_message.reply_text(
-        "Futbol skor overlay botu hazır. İki logo görselini ve kısa videoyu veya herkese açık linki istediğin sırayla gönder. "
-        "Mevcut yüklemeni korurum; /start hiçbir şeyi sıfırlamaz.\n\n"
-        "Sana #00FF00 yeşil ekranlı MP4 vereceğim. /status durumu gösterir; sadece /new bu oturumu temizler.\n"
-        f"Şu an: {status(s)}"
+        "Futbol skor overlay botu hazır.\n\n"
+        "EN KOLAY YÖNTEM: video + iki takım logosunu (3 dosyayı) hepsini "
+        "AYNI ANDA, tek bir albüm/galeri seçimi olarak gönder - otomatik işlerim.\n\n"
+        "İstersen tek tek de gönderebilirsin (video, sonra logo 1, sonra logo 2). "
+        "Her yeni video önceki logoları otomatik siler, böylece farklı maçlar karışmaz.\n\n"
+        "/status - durumu gösterir\n/new - oturumu temizler"
     )
 
 
 async def new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    old = SESSIONS.pop(update.effective_user.id, None)
-    if old and old.job_dir:
-        shutil.rmtree(old.job_dir, ignore_errors=True)
-    await update.effective_message.reply_text("Yeni oturum oluşturuldu. İki logo ile video veya herkese açık link gönder.")
+    reset_session(update.effective_user.id)
+    await update.effective_message.reply_text("Oturum temizlendi. Video + iki logo gönder.")
 
 
 async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = session_for(update.effective_user.id)
     missing = []
     if len(s.logos) < 2: missing.append(f"{2-len(s.logos)} logo görseli")
-    if not source_ready(s): missing.append("video veya herkese açık link")
-    suffix = " Şu anda işleniyor." if s.running else ("İşlem için hazır." if not missing else " Hâlâ gerekli: " + ", ".join(missing) + ".")
+    if not s.video: missing.append("video")
+    suffix = " Şu anda işleniyor." if s.running else (" İşlem için hazır." if not missing else " Hâlâ gerekli: " + ", ".join(missing) + ".")
     await update.effective_message.reply_text(status(s) + suffix)
+
+
+async def unrecognized_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "Link desteği artık yok - sadece video + 2 logo gönder (tek tek ya da hepsini birden albüm olarak)."
+    )
+
+
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    group_id = msg.media_group_id
+    if group_id:
+        # Albüm olarak gelen dosyalar ayrı ayrı update'ler halinde ulaşır,
+        # hepsi toplanana kadar kısa bir süre bekliyoruz (debounce).
+        bucket = GROUPS.setdefault(group_id, {
+            "messages": [], "chat_id": update.effective_chat.id, "user_id": update.effective_user.id, "task": None,
+        })
+        bucket["messages"].append(msg)
+        if bucket["task"]:
+            bucket["task"].cancel()
+        bucket["task"] = context.application.create_task(
+            _process_group_after_delay(group_id, context), update=update
+        )
+        return
+    # Tek tek gönderilen dosyalar - eski akış (geriye dönük uyumlu)
+    is_video = bool(msg.video) or bool(msg.document and msg.document.mime_type and "video" in msg.document.mime_type)
+    if is_video:
+        await save_video(update, context)
+    else:
+        await save_logo(update, context)
+
+
+async def _process_group_after_delay(group_id: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        await asyncio.sleep(GROUP_DEBOUNCE_SECONDS)
+    except asyncio.CancelledError:
+        return
+    bucket = GROUPS.pop(group_id, None)
+    if not bucket:
+        return
+    await process_batch(bucket["messages"], bucket["chat_id"], bucket["user_id"], context)
+
+
+async def process_batch(messages: list, chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    video_msg = None
+    photo_msgs = []
+    for m in messages:
+        is_video = bool(m.video) or bool(m.document and m.document.mime_type and "video" in m.document.mime_type)
+        if is_video and video_msg is None:
+            video_msg = m
+        elif m.photo or (m.document and m.document.mime_type and "image" in m.document.mime_type):
+            photo_msgs.append(m)
+
+    if video_msg is None or len(photo_msgs) < 2:
+        await context.bot.send_message(
+            chat_id,
+            "Albümde 1 video ve 2 logo görseli olmalı. "
+            f"Bulduğum: video {'var' if video_msg else 'yok'}, logo {len(photo_msgs)}/2. Tekrar dener misin?",
+        )
+        return
+
+    reset_session(user_id)  # her toplu iş kendi başına - eski maçla karışmasın
+    s = session_for(user_id)
+    s.job_dir = _job_dir_for(user_id)
+    s.running = True
+
+    status_msg = await context.bot.send_message(chat_id, "3 dosya alındı, indiriyorum…")
+    try:
+        video_media = video_msg.video or video_msg.document
+        video_size = getattr(video_media, "file_size", 0) or 0
+        if video_size > MAX_TG:
+            await status_msg.edit_text(
+                f"Video {video_size/1024/1024:.1f} MB - en fazla {MAX_TG/1024/1024:.0f} MB indirebilirim. "
+                "Videoyu biraz daha düşük çözünürlükte (360p/480p) tekrar gönder."
+            )
+            s.running = False
+            return
+        video_path = s.job_dir / "source.mp4"
+        await (await video_media.get_file()).download_to_drive(video_path)
+        s.video = video_path
+        if video_msg.caption:
+            s.note = video_msg.caption
+
+        for i, pm in enumerate(photo_msgs[:2]):
+            photo = pm.photo[-1] if pm.photo else pm.document
+            logo_path = s.job_dir / f"logo-{i+1}.img"
+            await (await photo.get_file()).download_to_drive(logo_path)
+            s.logos.append(logo_path)
+
+        await run_job(status_msg, chat_id, s, context)
+    except Exception:
+        LOG.exception("batch failed")
+        await status_msg.edit_text("Bu 3 dosya işlenirken bir hata oldu. Tekrar gönder, ya da video boyutunu küçült.")
+        s.running = False
 
 
 async def save_logo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = session_for(update.effective_user.id)
     if len(s.logos) >= 2:
-        await update.effective_message.reply_text("Zaten iki logo var. Değiştirmek istersen yalnızca /new kullan.")
+        await update.effective_message.reply_text(
+            "Zaten iki logo var. Yeni bir maç için video göndermen yeterli (eski logoları otomatik temizler), "
+            "ya da /new yaz."
+        )
         return
     msg = update.effective_message
     photo = msg.photo[-1] if msg.photo else msg.document
@@ -91,7 +202,7 @@ async def save_logo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text("Bu logo 10 MB'den büyük. Daha küçük PNG, JPG veya WebP olarak gönder.")
         return
     if not s.job_dir:
-        s.job_dir = Path(tempfile.mkdtemp(prefix=f"tg-{update.effective_user.id}-", dir=WORK))
+        s.job_dir = _job_dir_for(update.effective_user.id)
     try:
         target = s.job_dir / f"logo-{len(s.logos)+1}.img"
         await (await photo.get_file()).download_to_drive(target)
@@ -104,82 +215,57 @@ async def save_logo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def save_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    s = session_for(update.effective_user.id)
+    user_id = update.effective_user.id
     msg = update.effective_message
     media = msg.video or msg.document
     size = getattr(media, "file_size", 0) or 0
     if size > MAX_TG:
         await msg.reply_text(
-            f"Bu dosya {size/1024/1024:.1f} MB. Normal Telegram Bulut Bot API ile en fazla "
-            f"{MAX_TG/1024/1024:.0f} MB indirebilirim. Herkese açık link gönder veya büyük yüklemeler için Local Bot API sunucusu kullan."
+            f"Bu dosya {size/1024/1024:.1f} MB. En fazla {MAX_TG/1024/1024:.0f} MB indirebilirim. "
+            "Videoyu biraz daha düşük çözünürlükte (360p/480p) tekrar gönder."
         )
         return
-    if not s.job_dir:
-        s.job_dir = Path(tempfile.mkdtemp(prefix=f"tg-{update.effective_user.id}-", dir=WORK))
+    # YENİ bir video = YENİ bir maç demektir - önceki maçın logolarını
+    # otomatik temizliyoruz ki yanlış logolarla eşleşmesin.
+    reset_session(user_id)
+    s = session_for(user_id)
+    s.job_dir = _job_dir_for(user_id)
     try:
-        await msg.reply_text("Video alındı; şimdi indiriyorum…")
+        await msg.reply_text("Video alındı; indiriyorum…")
         target = s.job_dir / "source.mp4"
         await (await media.get_file()).download_to_drive(target)
         s.video = target
         if msg.caption: s.note = msg.caption
-        await msg.reply_text("Video kaydedildi. " + status(s))
-        await maybe_process(update, context, s)
+        await msg.reply_text("Video kaydedildi. Şimdi iki takımın logosunu gönder. " + status(s))
     except Exception:
         LOG.exception("video download failed")
-        await msg.reply_text("Bu video indirilemedi. Tekrar dene veya herkese açık video linki gönder.")
-
-
-async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    s = session_for(update.effective_user.id)
-    value = update.effective_message.text.strip()
-    found = URL_RE.search(value)
-    if found:
-        s.url = found.group(0).rstrip(".,)")
-        s.note = value.replace(found.group(0), "").strip()
-        await update.effective_message.reply_text("Herkese açık link kaydedildi. İki logo da hazır olunca indireceğim. " + status(s))
-        await maybe_process(update, context, s)
-    else:
-        s.note = value
-        await update.effective_message.reply_text("Maç notu kaydedildi. Bunu ipucu olarak kullanırım; doğrulanmış skor saymam.")
+        await msg.reply_text("Bu video indirilemedi. Tekrar dene.")
 
 
 async def maybe_process(update: Update, context: ContextTypes.DEFAULT_TYPE, s: Session) -> None:
-    if s.running or len(s.logos) != 2 or not source_ready(s): return
+    if s.running or len(s.logos) != 2 or not s.video:
+        return
     s.running = True
-    context.application.create_task(run_job(update, context, s), update=update)
+    status_msg = await update.effective_message.reply_text("Her şey hazır. Analiz başlıyor…")
+    context.application.create_task(run_job(status_msg, update.effective_chat.id, s, context), update=update)
 
 
-async def run_job(update: Update, context: ContextTypes.DEFAULT_TYPE, s: Session) -> None:
-    msg = await update.effective_message.reply_text("Her şey hazır. Kaynağı kontrol edip analizi başlatıyorum…")
+async def run_job(status_msg, chat_id: int, s: Session, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_VIDEO)
-        source_problem = ""
-        if s.video is None:
-            await msg.edit_text("Herkese açık link indiriliyor…")
-            try:
-                s.video = await asyncio.to_thread(download_url, s.url, s.job_dir)
-            except RuntimeError as exc:
-                # YouTube can refuse cloud IPs. Send a useful template instead
-                # of abandoning the user's logos and session.
-                source_problem = str(exc)
-        if s.video:
-            await msg.edit_text("Video örnekleniyor; maç ve sayılan goller doğrulanıyor…")
-            facts = await asyncio.to_thread(analyse_clip, s.video, s.note)
-        else:
-            facts = MatchFacts(analysis_note="Kaynak indirilemedi; 10 saniyelik başlangıç overlay'i oluşturuldu")
-        await msg.edit_text("Yeşil ekran skor zaman çizelgesi oluşturuluyor…")
+        await status_msg.edit_text("Video örnekleniyor; goller doğrulanıyor…")
+        facts = await asyncio.to_thread(analyse_clip, s.video, s.note)
+        await status_msg.edit_text("Yeşil ekran skor zaman çizelgesi oluşturuluyor…")
         output = await asyncio.to_thread(make_overlay, s.video, s.logos[0], s.logos[1], facts, s.job_dir)
         confidence = "doğrulandı" if facts.confidence >= 0.75 else "DOĞRULANMADI"
-        caption = f"Yeşil ekran overlay hazır ({confidence}). {facts.home} {facts.final_home}-{facts.final_away} {facts.away}."
+        caption = f"Yeşil ekran overlay hazır ({confidence}). {facts.final_home}-{facts.final_away}."
         if facts.analysis_note:
             caption += "\nNot: " + facts.analysis_note
-        if source_problem:
-            caption += "\nNot: Linkten indirilemedi, gerçek sebep: " + source_problem[:500]
-        await context.bot.send_document(update.effective_chat.id, document=output.open("rb"), caption=caption)
-        await msg.delete()
+        with output.open("rb") as f:
+            await context.bot.send_document(chat_id, document=f, caption=caption)
+        await status_msg.delete()
     except Exception as exc:
         LOG.exception("job failed")
-        await msg.edit_text(f"İşlem tamamlanamadı: {str(exc)[:700]}\nLogo ve linklerin kayıtlı. Sorunu düzeltip yeniden gönder; /start gerekli değil.")
+        await status_msg.edit_text(f"İşlem tamamlanamadı: {str(exc)[:700]}\nVideoyu ve logoları tekrar gönder.")
     finally:
         s.running = False
 
@@ -191,9 +277,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("new", new))
     app.add_handler(CommandHandler("status", show_status))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, save_logo))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, save_video))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE | filters.VIDEO | filters.Document.VIDEO, handle_media))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unrecognized_text))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

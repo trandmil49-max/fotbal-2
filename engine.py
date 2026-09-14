@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -126,21 +127,34 @@ def download_url(url: str, job_dir: Path) -> Path:
     return path
 
 
-def _frames(path: Path, count: int = 12) -> tuple[list[np.ndarray], float]:
+def _frames(path: Path, count: int = 12) -> tuple[list[np.ndarray], float, list[float]]:
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened(): raise RuntimeError("Video açılamadı. MP4/H.264 olarak tekrar yükleyin veya başka bir herkese açık bağlantı deneyin.")
     fps = cap.get(cv2.CAP_PROP_FPS) or 24
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     duration = total / fps if total else 0
     if duration <= 0 or duration > 15 * 60: raise RuntimeError("Video süresi okunamadı veya video 15 dakikadan uzun.")
-    positions = np.linspace(0, max(0, total - 1), count, dtype=int)
-    result = []
-    for pos in positions:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(pos)); ok, frame = cap.read()
-        if ok: result.append(frame)
+    # ÖNEMLİ: kare NUMARASINA göre değil, gerçek ZAMANA (milisaniye) göre
+    # arama yapıyoruz. Bazı videolarda toplam kare sayısı metadata'sı hatalı
+    # oluyor, bu da "28. saniyedeki gol 50. saniyede görünüyor" gibi ciddi
+    # zaman kaymalarına yol açıyordu. Milisaniye bazlı arama, videonun
+    # gerçek zaman bilgisini kullandığı için bu kaymaya yol açmıyor.
+    positions_ms = np.linspace(0, max(0.0, duration * 1000 - 40), count)
+    result: list[np.ndarray] = []
+    timestamps: list[float] = []
+    for pos_ms in positions_ms:
+        cap.set(cv2.CAP_PROP_POS_MSEC, float(pos_ms))
+        ok, frame = cap.read()
+        if ok:
+            result.append(frame)
+            # Videonun bize GERÇEKTEN hangi zamanı verdiğini geri okuyoruz -
+            # istediğimiz zamanla verilen kare birebir aynı olmayabilir, bu
+            # yüzden gerçek değeri kullanmak en doğrusu.
+            actual_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            timestamps.append((actual_ms / 1000.0) if actual_ms and actual_ms > 0 else (pos_ms / 1000.0))
     cap.release()
     if not result: raise RuntimeError("Videoda okunabilir görüntü karesi bulunamadı.")
-    return result, duration
+    return result, duration, timestamps
 
 
 def _score_from_frame(frame: np.ndarray) -> tuple[int, int] | None:
@@ -167,7 +181,7 @@ def _score_from_frame(frame: np.ndarray) -> tuple[int, int] | None:
     return None
 
 
-def _local_score_timeline(frames: list[np.ndarray], duration: float) -> list[Goal]:
+def _local_score_timeline(frames: list[np.ndarray], timestamps: list[float]) -> list[Goal]:
     """Turn stable visual score changes into goals; no score change means no goal."""
     stable: tuple[int, int] | None = None
     candidate: tuple[int, int] | None = None
@@ -184,7 +198,7 @@ def _local_score_timeline(frames: list[np.ndarray], duration: float) -> list[Goa
         # Two matching samples prevent a one-frame OCR mistake from becoming a goal.
         if repeats < 2 or observed == stable:
             continue
-        stamp = duration * index / max(1, len(frames) - 1)
+        stamp = timestamps[index]  # kareyi GERÇEKTEN hangi saniyede okuduysak o
         if stable is None:
             stable = observed
             continue
@@ -198,12 +212,12 @@ def _local_score_timeline(frames: list[np.ndarray], duration: float) -> list[Goa
 
 def analyse_clip(path: Path, hint: str) -> MatchFacts:
     # One frame per two seconds is local CPU work, not a paid cloud call.
-    _, duration = _frames(path, 2)
-    frames, _ = _frames(path, min(60, max(12, int(duration / 2))))
+    _, duration, _ = _frames(path, 2)
+    frames, _, timestamps = _frames(path, min(60, max(12, int(duration / 2))))
     title_file = path.parent / "source-details.txt"
     if title_file.exists():
         hint = (hint + " | public source title: " + title_file.read_text(encoding="utf-8")[:180]).strip(" |")
-    facts = MatchFacts(goals=_local_score_timeline(frames, duration))
+    facts = MatchFacts(goals=_local_score_timeline(frames, timestamps))
     # A source title/caption can label teams, but never creates a score event.
     if hint:
         m = re.search(r"([^,;]+?)\s+(?:vs\.?|v\.?|[-–])\s+([^,;]+)", hint, re.I)
@@ -216,11 +230,14 @@ def analyse_clip(path: Path, hint: str) -> MatchFacts:
 
 
 def _font(size: int) -> ImageFont.ImageFont:
-    # The condensed bold face matches the supplied large score reference and
-    # is installed explicitly in the Railway Docker image.
-    candidates = [r"C:\Windows\Fonts\impact.ttf", r"C:\Windows\Fonts\arialbd.ttf",
-                  "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf",
-                  "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
+    # Anton, referans görsellerdeki kalın/net skor tablosu fontuna en yakın
+    # olan ücretsiz font - Dockerfile'da indirilip /app/fonts'a konuluyor.
+    candidates = [
+        str(Path(__file__).parent / "fonts" / "Anton-Regular.ttf"),
+        r"C:\Windows\Fonts\impact.ttf", r"C:\Windows\Fonts\arialbd.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf",
+    ]
     for candidate in candidates:
         if Path(candidate).exists():
             try: return ImageFont.truetype(candidate, size)
@@ -228,7 +245,7 @@ def _font(size: int) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-def _logo(path: Path, size: int = 230) -> Image.Image:
+def _logo(path: Path, size: int = 260) -> Image.Image:
     try: image = Image.open(path).convert("RGBA")
     except Exception as exc: raise RuntimeError(f"Logo açılamadı ({path.name}). PNG, JPG veya WebP gönder.") from exc
     px = np.asarray(image).copy()
@@ -246,57 +263,96 @@ def _logo(path: Path, size: int = 230) -> Image.Image:
     result = Image.fromarray(px).convert("RGBA")
     result.thumbnail((size, size), Image.Resampling.LANCZOS)
     canvas = Image.new("RGBA", (size, size), (0,0,0,0)); canvas.alpha_composite(result, ((size-result.width)//2, (size-result.height)//2))
-    return canvas
+    # ÇOK ÖNEMLİ: kenarlardaki yarı saydam pikselleri SERTLEŞTİRİYORUZ
+    # (ya tam görünür ya tam görünmez, arası yok). Yarı saydam bir piksel
+    # yeşil ekrana bindirilince rengi yeşille KARIŞIYOR ve bu karışım,
+    # kullanıcı arka planı kestiğinde logonun etrafında yeşil bir "sızıntı"
+    # olarak kalıyordu. Sert kenar bu sorunu kökten çözüyor.
+    final_px = np.array(canvas)
+    final_px[:, :, 3] = np.where(final_px[:, :, 3] >= 128, 255, 0).astype(np.uint8)
+    return Image.fromarray(final_px, mode="RGBA")
 
 
 def _center(draw: ImageDraw.ImageDraw, text: str, y: int, font: ImageFont.ImageFont, fill=(255,255,255)) -> None:
-    box = draw.textbbox((0,0), text, font=font, stroke_width=3)
-    draw.text(((1080-(box[2]-box[0]))/2, y), text, font=font, fill=fill, stroke_width=3, stroke_fill=(0,0,0))
+    box = draw.textbbox((0,0), text, font=font, stroke_width=4)
+    draw.text(((1080-(box[2]-box[0]))/2, y), text, font=font, fill=fill, stroke_width=4, stroke_fill=(0,0,0))
 
 
 def make_overlay(source: Path | None, logo_home: Path, logo_away: Path, facts: MatchFacts, job_dir: Path) -> Path:
     # If a link host refuses the download, still return a usable 10-second
     # green-screen template instead of failing the entire Telegram job.
     duration = _frames(source, 2)[1] if source else 10.0
-    # TikTok-friendly vertical overlay. Herşey ekranın DİKEY ORTASINDA
-    # tek bir satırda duruyor: logo - skor - VS - skor - logo.
-    width, height, fps = 1080, 1920, 12
+    width, height, fps = 1080, 1920, 25
     output = job_dir / "green-screen-score-overlay.mp4"
-    writer = cv2.VideoWriter(str(output), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-    if not writer.isOpened(): raise RuntimeError("MP4 yazıcısı kullanılamıyor. Railway dağıtım kaydını kontrol edin.")
-    left, right = _logo(logo_home, 190), _logo(logo_away, 190)
-    events = [g for g in facts.goals if g.awarded]
-    home = away = event_index = 0
-    total = max(1, int(duration * fps))
 
-    logo_size = 190
-    center_y = height // 2  # ekranın tam dikey ortası
+    logo_size = 260
+    # Referans görsellerdeki gibi grafiği ekranın ALT ÜÇTE BİRİNE koyuyoruz
+    # (tam ortada değil).
+    center_y = int(height * 0.85)
     logo_top = center_y - logo_size // 2
-    logo_gap = 270  # merkezden logoya uzaklık - çift haneli skorlarda bile metinle çakışmaması, ekran dışına taşmaması için hesaplandı
-    center_font_size = 85
+    logo_gap = 235  # merkezden logoya uzaklık - çift haneli skorlarda bile metinle çakışmaz
+    center_font_size = 150
 
-    for n in range(total):
-        t = n / fps
-        while event_index < len(events) and events[event_index].second <= t:
-            if events[event_index].team == "home": home += 1
-            else: away += 1
-            event_index += 1
-        image = Image.new("RGB", (width,height), GREEN); draw = ImageDraw.Draw(image)
-        if facts.stage:
-            _center(draw, facts.stage, logo_top - 70, _font(54))
-        image.paste(left, (540 - logo_gap - logo_size, logo_top), left)
-        image.paste(right, (540 + logo_gap, logo_top), right)
-        # Logo - skor - VS - skor - logo, hepsi AYNI satırda, dikey ortada
-        center_text = f"{home}   VS   {away}"
-        box = draw.textbbox((0, 0), center_text, font=_font(center_font_size), stroke_width=3)
-        text_h = box[3] - box[1]
-        draw.text(
-            (540 - (box[2] - box[0]) / 2, center_y - text_h / 2 - box[1]),
-            center_text, font=_font(center_font_size), fill=(255,255,255), stroke_width=3, stroke_fill=(0,0,0),
-        )
-        if facts.season:
-            _center(draw, facts.season.upper(), logo_top + logo_size + 40, _font(36), (220,220,220))
-        writer.write(cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR))
-    writer.release()
-    if not output.exists() or output.stat().st_size < 1024: raise RuntimeError("Overlay oluşturuldu fakat kullanılabilir MP4 üretilmedi.")
+    left, right = _logo(logo_home, logo_size), _logo(logo_away, logo_size)
+    events = sorted((g for g in facts.goals if g.awarded), key=lambda g: g.second)
+
+    # Saniye saniye kare üretmek yerine, skorun SABİT kaldığı her bölüm için
+    # TEK BİR yüksek kaliteli görsel üretiyoruz, sonra ffmpeg ile bunları
+    # gerçek sürelerine göre birleştiriyoruz. Bu hem çok daha hızlı hem de
+    # eski yöntemden (kare kare cv2 ile yazma) çok daha net/keskin bir
+    # görüntü veriyor - büyütüldüğünde bulanıklaşmıyor.
+    segments: list[tuple[float, float, int, int]] = []
+    home = away = 0
+    prev_t = 0.0
+    for g in events:
+        if g.second > prev_t:
+            segments.append((prev_t, g.second, home, away))
+        if g.team == "home": home += 1
+        else: away += 1
+        prev_t = g.second
+    segments.append((prev_t, duration, home, away))
+
+    concat_path = job_dir / "concat_list.txt"
+    frame_paths: list[Path] = []
+    with open(concat_path, "w") as list_file:
+        for i, (start, end, h, a) in enumerate(segments):
+            seg_duration = max(end - start, 0.1)
+            image = Image.new("RGB", (width, height), GREEN)
+            draw = ImageDraw.Draw(image)
+            if facts.stage:
+                _center(draw, facts.stage, logo_top - 90, _font(54))
+            # Referans görsellerdeki gibi: logo - SAYI - tire - SAYI - logo, tek satırda
+            center_text = f"{h} - {a}"
+            box = draw.textbbox((0, 0), center_text, font=_font(center_font_size), stroke_width=4)
+            text_h = box[3] - box[1]
+            draw.text(
+                (540 - (box[2] - box[0]) / 2, center_y - text_h / 2 - box[1]),
+                center_text, font=_font(center_font_size), fill=(255,255,255), stroke_width=4, stroke_fill=(0,0,0),
+            )
+            image.paste(left, (540 - logo_gap - logo_size, logo_top), left)
+            image.paste(right, (540 + logo_gap, logo_top), right)
+            if facts.season:
+                _center(draw, facts.season.upper(), logo_top + logo_size + 40, _font(36), (220,220,220))
+            frame_path = job_dir / f"seg_{i}.png"
+            image.save(frame_path)
+            frame_paths.append(frame_path)
+            list_file.write(f"file '{frame_path}'\n")
+            list_file.write(f"duration {seg_duration}\n")
+        if frame_paths:
+            list_file.write(f"file '{frame_paths[-1]}'\n")
+
+    cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_path),
+        "-vf", f"fps={fps},format=yuv420p", "-c:v", "libx264", "-preset", "medium",
+        "-crf", "18", "-pix_fmt", "yuv420p", str(output),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    for p in frame_paths:
+        if p.exists(): p.unlink()
+    if concat_path.exists(): concat_path.unlink()
+
+    if result.returncode != 0 or not output.exists() or output.stat().st_size < 1024:
+        tail = "\n".join(result.stderr.strip().splitlines()[-10:])
+        raise RuntimeError(f"Overlay video oluşturulamadı (ffmpeg hatası): {tail[:600]}")
     return output
